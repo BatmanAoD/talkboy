@@ -6,7 +6,6 @@ use futures::{Future, Stream};
 use hyper::client::{Client as HyperClient, HttpConnector};
 use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
 use hyper::http::uri::Authority;
-use hyper::http::response;
 use hyper::service::{MakeService, Service};
 use hyper::{Body, Chunk, Request, Response, Server, Uri};
 use hyper_rustls::HttpsConnector;
@@ -206,16 +205,15 @@ impl Service for ProxyService {
         let ignored_status_codes = self.ignored_status_codes.clone();
         let archive_path = self.archive_path.clone();
 
-        let req_logger = self
-            .logger
+        let req_logger = /*Arc::new(*/
+            self.logger
             .new(o!("path" => path.clone(), "method" => method.clone()));
 
         let (head, body) = proxied_req.into_parts();
         let client = self.client.clone();
         Box::new(
-            body
-                .concat2()
-                .map_err(Error::from)
+            body.concat2()
+                .map_err(|e| Error::from(e))
                 .and_then(move |b| {
                     let mut har = HarSession::new();
                     let body: Vec<u8> = b.into_bytes().into_iter().collect();
@@ -224,46 +222,43 @@ impl Service for ProxyService {
                     let req = Request::from_parts(head, new_body);
                     Ok((req, har))
                 })
-                .and_then(move |(request, har)| {
-                     RequestSender {
-                        client, har, ignored_status_codes, method, path_without_query, archive_path, req_logger
-                    }.send_request(request)
+                .and_then(move |(request, mut har)| {
+                    info!(req_logger, "Sending request");
+                    har.start_session();
+                    // Not sure how to avoid this without `Arc`. The compiler
+                    // can't know which lambda to move `req_logger` into,
+                    // because it doesn't know which one will be called; and
+                    // the lambdas cannot "share" the same object.
+                    let req_logger_clone = req_logger.clone();
+                    client.request(request)
+                        .map_err(move |e| {
+                            let err_logger = req_logger_clone.new(o!("area" => "client-error"));
+                            error!(err_logger, "{}", e);
+                            Error::from(e)
+                        })
+                        .and_then(move |resp| Ok((resp, har, req_logger)))
+                })
+                .and_then(move |(resp, har, req_logger)| {
+                    let res = create_proxied_response(resp);
+                    ResponseHandler {
+                        har, ignored_status_codes, method, path_without_query, archive_path, req_logger
+                    }.handle_response(res)
                 })
         )
     }
 }
 
-struct RequestSender {
-    client: Client,
+struct ResponseHandler {
     har: HarSession,
     ignored_status_codes: Vec<u16>,
     method: String,
     path_without_query: String,
     archive_path: PathBuf,
-    req_logger: Logger
+    req_logger: Logger,
 }
 
-impl RequestSender {
-    fn send_request(mut self, request: Request<Body>) -> <ProxyService as Service>::Future {
-        info!(self.req_logger, "Sending request");
-        let err_logger = self.req_logger.new(o!("area" => "client-error"));
-        self.har.start_session();
-        Box::new(
-            self.client
-                .request(request)
-                .map_err(move |e| {
-                    error!(err_logger, "{}", e);
-                    Error::from(e)
-                })
-                .and_then(move |resp| self.handle_client_response(resp))
-        )
-    }
-
-    fn handle_client_response(
-        self,
-        resp: Response<Body>,
-    ) -> <ProxyService as Service>::Future {
-        let res = create_proxied_response(resp);
+impl ResponseHandler {
+    fn handle_response(mut self, res: Response<Body>) -> <ProxyService as Service>::Future {
         let (head, body) = res.into_parts();
         let res_logger = self.req_logger.new(o!("status" => head.status.as_u16()));
         let err_logger = res_logger.new(o!("area" => "body-error"));
@@ -275,48 +270,40 @@ impl RequestSender {
                     Error::from(e)
                 })
                 .and_then(move |b| {
-                    self.record_response(head, b.into_bytes().into_iter().collect(), res_logger)
+                    let body: Vec<u8> = b.into_bytes().into_iter().collect();
+                    self.har.record_response(&head, body.clone());
+                    if self.ignored_status_codes.contains(&head.status.as_u16()) {
+                        info!(
+                            res_logger,
+                            "Ignoring response with status {}",
+                            head.status.as_u16()
+                        );
+                    } else {
+                        self.har.commit()?;
+                        let file_name_part =
+                            format!("{}.{}", self.method, self.path_without_query);
+                        trace!(
+                            res_logger,
+                            "Writing file to dir {:?}, name fragment {}",
+                            &self.archive_path,
+                            file_name_part
+                        );
+                        let filename =
+                            self.har.write_to_dir(&self.archive_path, file_name_part)?;
+                        info!(
+                            res_logger,
+                            "Received Response, Wrote file"; "file_name" => FnValue(|_| {
+                                self.archive_path.join(&filename).to_string_lossy().into_owned()
+                            }));
+                    }
+                    let new_body: Body = Body::from(Chunk::from(body));
+                    Ok(Response::from_parts(head, new_body))
                 })
                 .map_err(move |e| {
                     error!(resp_err_logger, "{}", e);
                     e
                 })
         )
-    }
-
-    fn record_response(
-        mut self,
-        head: response::Parts,
-        body: Vec<u8>,
-        res_logger: Logger,
-    ) -> Result<Response<Body>, Error> {
-        self.har.record_response(&head, body.clone());
-        if self.ignored_status_codes.contains(&head.status.as_u16()) {
-            info!(
-                res_logger,
-                "Ignoring response with status {}",
-                head.status.as_u16()
-            );
-        } else {
-            self.har.commit()?;
-            let file_name_part =
-                format!("{}.{}", self.method, self.path_without_query);
-            trace!(
-                res_logger,
-                "Writing file to dir {:?}, name fragment {}",
-                &self.archive_path,
-                file_name_part
-            );
-            let filename =
-                self.har.write_to_dir(&self.archive_path, file_name_part)?;
-            info!(
-                res_logger,
-                "Received Response, Wrote file"; "file_name" => FnValue(|_| {
-                    self.archive_path.join(&filename).to_string_lossy().into_owned()
-                }));
-        }
-        let new_body: Body = Body::from(Chunk::from(body));
-        Ok(Response::from_parts(head, new_body))
     }
 }
 
