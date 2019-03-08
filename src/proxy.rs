@@ -239,10 +239,14 @@ impl Service for ProxyService {
                         .and_then(move |resp| Ok((resp, har, req_logger)))
                 })
                 .and_then(move |(resp, har, req_logger)| {
-                    let res = create_proxied_response(resp);
-                    ResponseHandler {
-                        har, ignored_status_codes, method, path_without_query, archive_path, req_logger
-                    }.handle_response(res)
+                    Ok((
+                        ResponseHandler {
+                            har, ignored_status_codes, method, path_without_query, archive_path, req_logger
+                        },
+                        create_proxied_response(resp)))
+                })
+                .and_then(move |(handler, res)| {
+                    handler.handle_response(res)
                 })
         )
     }
