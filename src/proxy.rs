@@ -242,49 +242,47 @@ impl Service for ProxyService {
                     let (head, body) = create_proxied_response(resp).into_parts();
                     Ok((har, req_logger, head, body))
                 })
-                .and_then(move |(mut har, req_logger, head, body)| {
+                .and_then(move |(har, req_logger, head, body)| {
                     let res_logger = req_logger.new(o!("status" => head.status.as_u16()));
                     let err_logger = res_logger.new(o!("area" => "body-error"));
-                    let resp_err_logger = res_logger.new(o!("area" => "resp-error"));
                     body.concat2()
                         .map_err(move |e| {
                             error!(err_logger, "{}", e);
                             Error::from(e)
                         })
-                        .and_then(move |b| {
-                            let body: Vec<u8> = b.into_bytes().into_iter().collect();
-                            har.record_response(&head, body.clone());
-                            if ignored_status_codes.contains(&head.status.as_u16()) {
-                                info!(
-                                    res_logger,
-                                    "Ignoring response with status {}",
-                                    head.status.as_u16()
-                                );
-                            } else {
-                                har.commit()?;
-                                let file_name_part =
-                                    format!("{}.{}", method, path_without_query);
-                                trace!(
-                                    res_logger,
-                                    "Writing file to dir {:?}, name fragment {}",
-                                    &archive_path,
-                                    file_name_part
-                                );
-                                let filename =
-                                    har.write_to_dir(&archive_path, file_name_part)?;
-                                info!(
-                                    res_logger,
-                                    "Received Response, Wrote file"; "file_name" => FnValue(|_| {
-                                        archive_path.join(&filename).to_string_lossy().into_owned()
-                                    }));
-                            }
-                            let new_body: Body = Body::from(Chunk::from(body));
-                            Ok(Response::from_parts(head, new_body))
-                        })
-                        .map_err(move |e| {
-                            error!(resp_err_logger, "{}", e);
-                            e
-                        })
+                        .and_then(move |b| { Ok((har, res_logger, head, b))})
+                })
+                .and_then(move |(mut har, res_logger, head, b)| {
+                    // What error is supposed to be logged by this logger...?
+                    // let resp_err_logger = res_logger.new(o!("area" => "resp-error"));
+                    let body: Vec<u8> = b.into_bytes().into_iter().collect();
+                    har.record_response(&head, body.clone());
+                    if ignored_status_codes.contains(&head.status.as_u16()) {
+                        info!(
+                            res_logger,
+                            "Ignoring response with status {}",
+                            head.status.as_u16()
+                        );
+                    } else {
+                        har.commit()?;
+                        let file_name_part =
+                            format!("{}.{}", method, path_without_query);
+                        trace!(
+                            res_logger,
+                            "Writing file to dir {:?}, name fragment {}",
+                            &archive_path,
+                            file_name_part
+                        );
+                        let filename =
+                            har.write_to_dir(&archive_path, file_name_part)?;
+                        info!(
+                            res_logger,
+                            "Received Response, Wrote file"; "file_name" => FnValue(|_| {
+                                archive_path.join(&filename).to_string_lossy().into_owned()
+                            }));
+                    }
+                    let new_body: Body = Body::from(Chunk::from(body));
+                    Ok(Response::from_parts(head, new_body))
                 })
         )
     }
