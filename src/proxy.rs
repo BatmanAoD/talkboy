@@ -239,73 +239,52 @@ impl Service for ProxyService {
                         .and_then(move |resp| Ok((resp, har, req_logger)))
                 })
                 .and_then(move |(resp, har, req_logger)| {
-                    Ok((
-                        ResponseHandler {
-                            har, ignored_status_codes, method, path_without_query, archive_path, req_logger
-                        },
-                        create_proxied_response(resp)))
+                    let (head, body) = create_proxied_response(resp).into_parts();
+                    Ok((har, req_logger, head, body))
                 })
-                .and_then(move |(handler, res)| {
-                    handler.handle_response(res)
-                })
-        )
-    }
-}
-
-struct ResponseHandler {
-    har: HarSession,
-    ignored_status_codes: Vec<u16>,
-    method: String,
-    path_without_query: String,
-    archive_path: PathBuf,
-    req_logger: Logger,
-}
-
-impl ResponseHandler {
-    fn handle_response(mut self, res: Response<Body>) -> <ProxyService as Service>::Future {
-        let (head, body) = res.into_parts();
-        let res_logger = self.req_logger.new(o!("status" => head.status.as_u16()));
-        let err_logger = res_logger.new(o!("area" => "body-error"));
-        let resp_err_logger = res_logger.new(o!("area" => "resp-error"));
-        Box::new(
-            body.concat2()
-                .map_err(move |e| {
-                    error!(err_logger, "{}", e);
-                    Error::from(e)
-                })
-                .and_then(move |b| {
-                    let body: Vec<u8> = b.into_bytes().into_iter().collect();
-                    self.har.record_response(&head, body.clone());
-                    if self.ignored_status_codes.contains(&head.status.as_u16()) {
-                        info!(
-                            res_logger,
-                            "Ignoring response with status {}",
-                            head.status.as_u16()
-                        );
-                    } else {
-                        self.har.commit()?;
-                        let file_name_part =
-                            format!("{}.{}", self.method, self.path_without_query);
-                        trace!(
-                            res_logger,
-                            "Writing file to dir {:?}, name fragment {}",
-                            &self.archive_path,
-                            file_name_part
-                        );
-                        let filename =
-                            self.har.write_to_dir(&self.archive_path, file_name_part)?;
-                        info!(
-                            res_logger,
-                            "Received Response, Wrote file"; "file_name" => FnValue(|_| {
-                                self.archive_path.join(&filename).to_string_lossy().into_owned()
-                            }));
-                    }
-                    let new_body: Body = Body::from(Chunk::from(body));
-                    Ok(Response::from_parts(head, new_body))
-                })
-                .map_err(move |e| {
-                    error!(resp_err_logger, "{}", e);
-                    e
+                .and_then(move |(mut har, req_logger, head, body)| {
+                    let res_logger = req_logger.new(o!("status" => head.status.as_u16()));
+                    let err_logger = res_logger.new(o!("area" => "body-error"));
+                    let resp_err_logger = res_logger.new(o!("area" => "resp-error"));
+                    body.concat2()
+                        .map_err(move |e| {
+                            error!(err_logger, "{}", e);
+                            Error::from(e)
+                        })
+                        .and_then(move |b| {
+                            let body: Vec<u8> = b.into_bytes().into_iter().collect();
+                            har.record_response(&head, body.clone());
+                            if ignored_status_codes.contains(&head.status.as_u16()) {
+                                info!(
+                                    res_logger,
+                                    "Ignoring response with status {}",
+                                    head.status.as_u16()
+                                );
+                            } else {
+                                har.commit()?;
+                                let file_name_part =
+                                    format!("{}.{}", method, path_without_query);
+                                trace!(
+                                    res_logger,
+                                    "Writing file to dir {:?}, name fragment {}",
+                                    &archive_path,
+                                    file_name_part
+                                );
+                                let filename =
+                                    har.write_to_dir(&archive_path, file_name_part)?;
+                                info!(
+                                    res_logger,
+                                    "Received Response, Wrote file"; "file_name" => FnValue(|_| {
+                                        archive_path.join(&filename).to_string_lossy().into_owned()
+                                    }));
+                            }
+                            let new_body: Body = Body::from(Chunk::from(body));
+                            Ok(Response::from_parts(head, new_body))
+                        })
+                        .map_err(move |e| {
+                            error!(resp_err_logger, "{}", e);
+                            e
+                        })
                 })
         )
     }
